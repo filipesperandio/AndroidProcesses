@@ -20,6 +20,9 @@ package com.jaredrummler.android.processes.models;
 import android.os.Parcel;
 import android.os.Parcelable;
 
+import com.jaredrummler.android.processes.AndroidProcesses;
+import com.jaredrummler.android.processes.Shell;
+
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
@@ -37,6 +40,9 @@ public class ProcFile extends File implements Parcelable {
    *     if an error occurred while reading.
    */
   protected static String readFile(String path) throws IOException {
+    if (AndroidProcesses.isProcessInfoHidden()) {
+      return Shell.SU.run("cat " + path).stdout;
+    }
     BufferedReader reader = null;
     try {
       StringBuilder output = new StringBuilder();

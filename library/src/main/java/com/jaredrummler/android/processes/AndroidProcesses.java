@@ -33,6 +33,7 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
 
 /**
@@ -98,6 +99,7 @@ public class AndroidProcesses {
   private static final int AID_READPROC = 3009;
 
   private static boolean loggingEnabled;
+  private static Boolean isProcessInfoHidden;
 
   /**
    * Toggle whether debug logging is enabled.
@@ -159,26 +161,32 @@ public class AndroidProcesses {
    * @return {@code true} if procfs is mounted with hidepid=2
    */
   public static boolean isProcessInfoHidden() {
-    BufferedReader reader = null;
-    try {
-      reader = new BufferedReader(new FileReader("/proc/mounts"));
-      for (String line = reader.readLine(); line != null; line = reader.readLine()) {
-        String[] columns = line.split("\\s+");
-        if (columns.length == 6 && columns[1].equals("/proc")) {
-          return columns[3].contains("hidepid=1") || columns[3].contains("hidepid=2");
+    if (isProcessInfoHidden == null) {
+      BufferedReader reader = null;
+      try {
+        reader = new BufferedReader(new FileReader("/proc/mounts"));
+        for (String line = reader.readLine(); line != null; line = reader.readLine()) {
+          String[] columns = line.split("\\s+");
+          if (columns.length == 6 && columns[1].equals("/proc")) {
+            isProcessInfoHidden = columns[3].contains("hidepid=1") || columns[3].contains("hidepid=2");
+            break;
+          }
+        }
+      } catch (IOException e) {
+        Log.d(TAG, "Error reading /proc/mounts. Checking if UID 'readproc' exists.");
+      } finally {
+        if (reader != null) {
+          try {
+            reader.close();
+          } catch (IOException ignored) {
+          }
         }
       }
-    } catch (IOException e) {
-      Log.d(TAG, "Error reading /proc/mounts. Checking if UID 'readproc' exists.");
-    } finally {
-      if (reader != null) {
-        try {
-          reader.close();
-        } catch (IOException ignored) {
-        }
+      if (isProcessInfoHidden == null) {
+        isProcessInfoHidden = android.os.Process.getUidForName("readproc") == AID_READPROC;
       }
     }
-    return android.os.Process.getUidForName("readproc") == AID_READPROC;
+    return isProcessInfoHidden;
   }
 
   /**
@@ -186,6 +194,28 @@ public class AndroidProcesses {
    */
   public static List<AndroidProcess> getRunningProcesses() {
     List<AndroidProcess> processes = new ArrayList<>();
+
+    if (isProcessInfoHidden()) {
+      Shell.CommandResult result = Shell.SU.run("ls /proc/");
+      if (result.success()) {
+        String[] lines = result.stdout.split("\n");
+        for (String line : lines) {
+          int pid;
+          try {
+            pid = Integer.parseInt(line);
+          } catch (NumberFormatException e) {
+            continue;
+          }
+          try {
+            processes.add(new AndroidProcess(pid));
+          } catch (IOException e) {
+            log(e, "Error reading from /proc/%d.", pid);
+          }
+        }
+      }
+      return processes;
+    }
+
     File[] files = new File("/proc").listFiles();
     for (File file : files) {
       if (file.isDirectory()) {
@@ -212,6 +242,29 @@ public class AndroidProcesses {
    */
   public static List<AndroidAppProcess> getRunningAppProcesses() {
     List<AndroidAppProcess> processes = new ArrayList<>();
+
+    if (isProcessInfoHidden()) {
+      Shell.CommandResult result = Shell.SU.run("ls /proc/");
+      if (result.success()) {
+        String[] lines = result.stdout.split("\n");
+        for (String line : lines) {
+          int pid;
+          try {
+            pid = Integer.parseInt(line);
+          } catch (NumberFormatException e) {
+            continue;
+          }
+          try {
+            processes.add(new AndroidAppProcess(pid));
+          } catch (AndroidAppProcess.NotAndroidAppProcessException ignored) {
+          } catch (IOException e) {
+            log(e, "Error reading from /proc/%d.", pid);
+          }
+        }
+      }
+      return processes;
+    }
+
     File[] files = new File("/proc").listFiles();
     for (File file : files) {
       if (file.isDirectory()) {
@@ -242,34 +295,18 @@ public class AndroidProcesses {
    * @return a list of user apps that are in the foreground.
    */
   public static List<AndroidAppProcess> getRunningForegroundApps(Context context) {
-    List<AndroidAppProcess> processes = new ArrayList<>();
-    File[] files = new File("/proc").listFiles();
+    List<AndroidAppProcess> processes = getRunningAppProcesses();
     PackageManager pm = context.getPackageManager();
-    for (File file : files) {
-      if (file.isDirectory()) {
-        int pid;
-        try {
-          pid = Integer.parseInt(file.getName());
-        } catch (NumberFormatException e) {
-          continue;
-        }
-        try {
-          AndroidAppProcess process = new AndroidAppProcess(pid);
-          if (process.foreground
-              // ignore system processes. First app user starts at 10000.
-              && (process.uid < 1000 || process.uid > 9999)
-              // ignore processes that are not running in the default app process.
-              && !process.name.contains(":")
-              // Ignore processes that the user cannot launch.
-              && pm.getLaunchIntentForPackage(process.getPackageName()) != null) {
-            processes.add(process);
-          }
-        } catch (AndroidAppProcess.NotAndroidAppProcessException ignored) {
-        } catch (IOException e) {
-          log(e, "Error reading from /proc/%d.", pid);
-          // System apps will not be readable on Android 5.0+ if SELinux is enforcing.
-          // You will need root access or an elevated SELinux context to read all files under /proc.
-        }
+    for (Iterator<AndroidAppProcess> iterator = processes.iterator(); iterator.hasNext();) {
+      AndroidAppProcess process = iterator.next();
+      if (!process.foreground
+          // ignore system processes. First app user starts at 10000.
+          || (process.uid >= 1000 && process.uid <= 9999)
+          // ignore processes that are not running in the default app process.
+          || process.name.contains(":")
+          // Ignore processes that the user cannot launch.
+          || pm.getLaunchIntentForPackage(process.getPackageName()) == null) {
+        iterator.remove();
       }
     }
     return processes;
@@ -308,7 +345,7 @@ public class AndroidProcesses {
    */
   public static List<RunningAppProcessInfo> getRunningAppProcessInfo(Context context) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
-      List<AndroidAppProcess> runningAppProcesses = AndroidProcesses.getRunningAppProcesses();
+      List<AndroidAppProcess> runningAppProcesses = getRunningAppProcesses();
       List<RunningAppProcessInfo> appProcessInfos = new ArrayList<>();
       for (AndroidAppProcess process : runningAppProcesses) {
         RunningAppProcessInfo info = new RunningAppProcessInfo(process.name, process.pid, null);

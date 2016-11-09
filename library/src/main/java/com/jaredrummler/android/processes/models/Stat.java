@@ -195,7 +195,10 @@ public final class Stat extends ProcFile {
    * executable is swapped out.
    */
   public String getComm() {
-    return fields[1].replace("(", "").replace(")", "");
+    if (fields.length >= 2) {
+      return fields[1].replace("(", "").replace(")", "");
+    }
+    return null;
   }
 
   /**
